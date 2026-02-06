@@ -145,6 +145,103 @@ def register_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to write CSV: {str(e)}"}
 
     @mcp.tool()
+    def csv_update(
+        path: str,
+        workspace_id: str,
+        agent_id: str,
+        session_id: str,
+        key_column: str,
+        rows: list[dict],
+    ) -> dict:
+        """
+        Update specific rows in a CSV file based on a key column.
+
+        This implementation uses DuckDB for high-performance updates and
+        an atomic write pattern to prevent data loss or corruption.
+
+        Args:
+            path: Path to the CSV file (relative to session sandbox)
+            workspace_id: Workspace identifier
+            agent_id: Agent identifier
+            session_id: Session identifier
+            key_column: The column name used to identify rows (e.g., 'id')
+            rows: List of dicts containing the key_column and columns to update
+
+        Returns:
+            dict with success status and count of updated rows
+        """
+        try:
+            import duckdb
+            import tempfile
+            import shutil
+        except ImportError:
+            return {"error": "DuckDB not installed. Use: uv pip install duckdb"}
+
+        try:
+            secure_path = get_secure_path(path, workspace_id, agent_id, session_id)
+
+            if not os.path.exists(secure_path):
+                return {"error": f"File not found: {path}"}
+
+            if not path.lower().endswith(".csv"):
+                return {"error": "File must have .csv extension"}
+
+            if not rows:
+                return {"error": "rows cannot be empty"}
+
+            # Connect to in-memory DuckDB and load current data
+            con = duckdb.connect(":memory:")
+            try:
+                con.execute(f"CREATE TABLE base AS SELECT * FROM read_csv_auto('{secure_path}')")
+
+                # Check for key_column existence
+                cols = [desc[0] for desc in con.execute("SELECT * FROM base LIMIT 0").description]
+                if key_column not in cols:
+                    return {"error": f"Key column '{key_column}' not found in CSV headers"}
+
+                # Map updates into a temporary DuckDB table
+                con.register("updates_view", rows)
+
+                # Build and execute dynamic SQL UPDATE
+                # Only update columns that were provided in the 'rows' input
+                update_cols = [c for c in rows[0].keys() if c != key_column and c in cols]
+                if not update_cols:
+                    return {"error": "No valid data columns provided for update"}
+
+                set_clause = ", ".join([f"{c} = updates_view.{c}" for c in update_cols])
+
+                con.execute(f"""
+                    UPDATE base
+                    SET {set_clause}
+                    FROM updates_view
+                    WHERE CAST(base.{key_column} AS VARCHAR) = CAST(updates_view.{key_column} AS VARCHAR)
+                """)
+
+                updated_count = con.execute("SELECT count(*) FROM updates_view").fetchone()[0]
+
+                # Write to a temp file first
+                temp_dir = os.path.dirname(secure_path)
+                with tempfile.NamedTemporaryFile(delete=False, dir=temp_dir, suffix=".tmp") as tmp:
+                    temp_path = tmp.name
+
+                con.execute(f"COPY base TO '{temp_path}' (HEADER, DELIMITER ',')")
+
+                # Swap the files
+                shutil.move(temp_path, secure_path)
+
+                return {
+                    "success": True,
+                    "path": path,
+                    "message": f"Successfully processed {updated_count} rows",
+                    "updated_count": updated_count
+                }
+            finally:
+                con.close()
+
+        except Exception as e:
+            return {"error": f"Update failed: {str(e)}"}
+
+    @mcp.tool()
     def csv_append(
         path: str,
         workspace_id: str,
